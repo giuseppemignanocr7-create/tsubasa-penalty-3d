@@ -83,7 +83,7 @@ export default function ResultScreen({
         </MangaPanel>
 
         {autoAdvance ? (
-          <div style={{ fontFamily: "'Russo One', sans-serif", fontSize: '0.7rem', color: '#888', marginTop: 8 }}>Prossimo tiro in 2s...</div>
+          <div style={{ fontFamily: "'Russo One', sans-serif", fontSize: '0.7rem', color: '#888', marginTop: 8 }}>Prossimo tiro in 4s...</div>
         ) : (
           <ActionButton onClick={onNext} size="medium">
             AVANTI

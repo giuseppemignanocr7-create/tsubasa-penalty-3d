@@ -57,37 +57,37 @@ export default function App() {
     if (state.mode !== 'training') return;
     const { phase, humanRole } = state;
 
-    // Human is shooter → bot picks keeper zone automatically
+    // Human is shooter → bot picks keeper zone automatically (1.5s per dare tempo alla voce)
     if (humanRole === 'shooter' && phase === PHASES.KEEPER_TURN) {
       botTimerRef.current = setTimeout(() => {
         actions.selectKeepZone(getRandomZone());
-      }, 600);
+      }, 1500);
       return () => clearTimeout(botTimerRef.current);
     }
 
-    // Human is keeper → bot picks shooter zone automatically
+    // Human is keeper → bot picks shooter zone automatically (1.5s)
     if (humanRole === 'keeper' && phase === PHASES.SHOOTER_TURN) {
       botTimerRef.current = setTimeout(() => {
         actions.selectShootZone(getRandomZone());
-      }, 600);
+      }, 1500);
       return () => clearTimeout(botTimerRef.current);
     }
 
-    // In training, auto-advance from PASS_DEVICE screens
+    // In training, auto-advance from PASS_DEVICE screens (pausa breve)
     if (phase === PHASES.PASS_DEVICE_SHOOTER) {
-      botTimerRef.current = setTimeout(() => actions.readyShooter(), 100);
+      botTimerRef.current = setTimeout(() => actions.readyShooter(), 800);
       return () => clearTimeout(botTimerRef.current);
     }
     if (phase === PHASES.PASS_DEVICE_KEEPER) {
-      botTimerRef.current = setTimeout(() => actions.readyKeeper(), 100);
+      botTimerRef.current = setTimeout(() => actions.readyKeeper(), 800);
       return () => clearTimeout(botTimerRef.current);
     }
   }, [state.phase, state.mode, state.humanRole, actions]);
 
-  // ---- Auto-advance result in training (2s) ----
+  // ---- Auto-advance result in training (4s — tempo per leggere e sentire la voce) ----
   useEffect(() => {
     if (state.mode !== 'training' || state.phase !== PHASES.RESULT) return;
-    const t = setTimeout(() => { resetScene(); actions.nextShot(); }, 2000);
+    const t = setTimeout(() => { resetScene(); actions.nextShot(); }, 4000);
     return () => clearTimeout(t);
   }, [state.mode, state.phase, actions, resetScene]);
 
@@ -126,15 +126,15 @@ export default function App() {
     if (p === PHASES.SHOOTER_TURN && prev !== PHASES.SHOOTER_TURN) {
       const scoreDiff = Math.abs(state.scores.holly - state.scores.benji);
       if (state.isSuddenDeath || penaltyNum >= PENALTIES_PER_PLAYER || (penaltyNum >= 3 && scoreDiff <= 1)) {
-        setTimeout(() => commentary.tensionMoment(), 500);
+        setTimeout(() => commentary.tensionMoment(), 600);
       } else {
-        setTimeout(() => commentary.preShot(cs), 300);
+        setTimeout(() => commentary.preShot(cs), 500);
       }
     }
 
     // Keeper is about to take their turn
     if (p === PHASES.KEEPER_TURN && prev !== PHASES.KEEPER_TURN) {
-      setTimeout(() => commentary.keeperReady(keeper), 300);
+      setTimeout(() => commentary.keeperReady(keeper), 500);
     }
 
     // Shot result came in (entering animation)

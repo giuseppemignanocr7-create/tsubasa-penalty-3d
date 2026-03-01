@@ -119,10 +119,14 @@ export default function AnimationScreen({
       setShowDramatic(true);
     });
 
-    // 3500ms: done
-    at(3500, () => {
-      ballStore.active = false;
+    // 4500ms: hide dramatic
+    at(4500, () => {
       setShowDramatic(false);
+    });
+
+    // 5000ms: done — lascia tempo alla voce di finire
+    at(5000, () => {
+      ballStore.active = false;
       onSceneRef.current?.({ netImpactPoint: null });
       onCompleteRef.current();
     });
