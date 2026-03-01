@@ -92,8 +92,8 @@ export default function App() {
   }, [state.mode, state.phase, actions, resetScene]);
 
   // ---- Handlers ----
-  const handleStartLocal = useCallback(() => { resetScene(); actions.startGame(); setMenuScreen('main'); }, [actions, resetScene]);
-  const handleStartTraining = useCallback((role) => { resetScene(); actions.startTraining(role); setMenuScreen('main'); }, [actions, resetScene]);
+  const handleStartLocal = useCallback(() => { commentary.warmUp(); resetScene(); actions.startGame(); setMenuScreen('main'); }, [actions, resetScene, commentary]);
+  const handleStartTraining = useCallback((role) => { commentary.warmUp(); resetScene(); actions.startTraining(role); setMenuScreen('main'); }, [actions, resetScene, commentary]);
   const handleReadyShooter = useCallback(() => { updateScene({ cameraPreset: 'shooterPick' }); actions.readyShooter(); }, [actions, updateScene]);
   const handleSelectShootZone = useCallback((zone) => { updateScene({ cameraPreset: 'wide' }); actions.selectShootZone(zone); }, [actions, updateScene]);
   const handleReadyKeeper = useCallback(() => { updateScene({ cameraPreset: 'keeperPick' }); actions.readyKeeper(); }, [actions, updateScene]);

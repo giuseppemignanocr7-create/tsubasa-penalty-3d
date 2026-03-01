@@ -2,18 +2,25 @@ import { useRef, useCallback, useEffect } from 'react';
 import { getCommentary, COMMENTARY_POOLS } from '../data/commentaryData';
 
 // ============================================================
-// GEMINI TTS — Voce Charon ESCLUSIVA
-// Strategia: pre-genera TUTTE le frasi in background all'avvio.
-// Se l'audio è in cache → play istantaneo.
-// Se non è ancora in cache → solo sottotitolo (niente Web Speech).
-// ZERO mix di voci. Sempre e solo Charon.
+// VOCE IMPECCABILE — Gemini Charon + Web Speech fallback
+//
+// Priorità: Charon (cache) > Charon (fetch live) > Web Speech IT
+// La voce c'è SEMPRE. Mai silenzio. Mai mix nello stesso momento.
+//
+// 1. warmUp() su click utente → crea AudioContext + avvia pre-gen
+// 2. speak() → cache hit? play Charon. Altrimenti fetch Charon
+//    con timeout 3s. Se fallisce → Web Speech italiana.
+// 3. Pre-gen aggressiva di TUTTE le frasi in background.
+// 4. Retry automatico su frasi fallite.
 // ============================================================
+
 const GEMINI_API_KEY = 'AIzaSyAffG9F10W0bWTlnQMkMjNm6dUdf7mpXIM';
 const GEMINI_TTS_MODEL = 'gemini-2.5-flash-preview-tts';
 const GEMINI_TTS_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_TTS_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 const GEMINI_VOICE = 'Charon';
+const FETCH_TIMEOUT_MS = 4000;
 
-// Tone → directorial prompt per Gemini TTS (telecronista italiano)
+// Tone → prompt per Gemini
 const TONE_PROMPTS = {
   excited:      'Dì con entusiasmo esplosivo da telecronista sportivo italiano, voce maschile, urlando di gioia:',
   tense:        'Dì con tono teso e drammatico da telecronista sportivo italiano, voce maschile, sussurrando quasi:',
@@ -23,12 +30,43 @@ const TONE_PROMPTS = {
   normal:       'Dì con tono professionale da telecronista sportivo italiano, voce maschile chiara e decisa:',
 };
 
-// ---- Audio cache globale (persiste tra re-render) ----
+// Tone → Web Speech params (fallback)
+const WS_TONES = {
+  excited:      { rate: 1.15, pitch: 1.3, volume: 1.0 },
+  tense:        { rate: 0.9,  pitch: 0.95, volume: 0.85 },
+  shocked:      { rate: 1.1,  pitch: 1.2, volume: 1.0 },
+  disappointed: { rate: 0.85, pitch: 0.85, volume: 0.8 },
+  epic:         { rate: 1.2,  pitch: 1.35, volume: 1.0 },
+  normal:       { rate: 1.0,  pitch: 1.1, volume: 0.9 },
+};
+
+// ---- Cache globale ----
 const _audioCache = new Map();
 const _pendingFetches = new Map();
+const _failedKeys = new Set();
 const MAX_CACHE = 300;
 
-// Decode Gemini PCM16 base64 → AudioBuffer
+// ---- Web Speech: trova e salva la migliore voce IT ----
+let _wsVoice = null;
+let _wsSearched = false;
+function getItalianVoice() {
+  if (_wsSearched) return _wsVoice;
+  if (!('speechSynthesis' in window)) return null;
+  const voices = speechSynthesis.getVoices();
+  if (!voices.length) return null;
+  _wsSearched = true;
+  const it = voices.filter(v => v.lang.startsWith('it'));
+  _wsVoice = it.find(v => v.localService) || it[0] || null;
+  if (_wsVoice) console.log(`[Voice] Web Speech fallback: ${_wsVoice.name}`);
+  return _wsVoice;
+}
+// Pre-load voices
+if ('speechSynthesis' in window) {
+  speechSynthesis.addEventListener('voiceschanged', () => { _wsSearched = false; _wsVoice = null; getItalianVoice(); });
+  getItalianVoice();
+}
+
+// ---- Decode Gemini PCM16 base64 → AudioBuffer ----
 function decodeGeminiPCM(base64Data, audioCtx) {
   const binaryStr = atob(base64Data);
   const len = binaryStr.length;
@@ -45,7 +83,15 @@ function decodeGeminiPCM(base64Data, audioCtx) {
   return buffer;
 }
 
-// Fetch singola frase TTS (con dedup per evitare doppie richieste)
+// ---- Fetch con timeout ----
+function fetchWithTimeout(url, options, timeoutMs) {
+  return Promise.race([
+    fetch(url, options),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT')), timeoutMs)),
+  ]);
+}
+
+// ---- Fetch singola frase TTS ----
 async function fetchTTS(text, tone, audioCtx) {
   const cacheKey = `${tone}::${text}`;
   if (_audioCache.has(cacheKey)) return _audioCache.get(cacheKey);
@@ -53,21 +99,17 @@ async function fetchTTS(text, tone, audioCtx) {
 
   const prompt = `${TONE_PROMPTS[tone] || TONE_PROMPTS.normal} "${text}"`;
 
-  const promise = fetch(GEMINI_TTS_URL, {
+  const promise = fetchWithTimeout(GEMINI_TTS_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
       generationConfig: {
         responseModalities: ['AUDIO'],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: GEMINI_VOICE }
-          }
-        }
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: GEMINI_VOICE } } }
       }
     }),
-  })
+  }, FETCH_TIMEOUT_MS)
     .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
     .then(json => {
       const data = json.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
@@ -78,11 +120,13 @@ async function fetchTTS(text, tone, audioCtx) {
         _audioCache.delete(firstKey);
       }
       _audioCache.set(cacheKey, buffer);
+      _failedKeys.delete(cacheKey);
       _pendingFetches.delete(cacheKey);
       return buffer;
     })
     .catch(err => {
       _pendingFetches.delete(cacheKey);
+      _failedKeys.add(cacheKey);
       throw err;
     });
 
@@ -90,20 +134,30 @@ async function fetchTTS(text, tone, audioCtx) {
   return promise;
 }
 
-// Pre-genera batch (throttled, background, non-blocking)
+// ---- Pre-gen batch con retry ----
 async function pregenBatch(phrases, audioCtx) {
+  // Pass 1: fetch tutto
   for (const { text, tone } of phrases) {
     const cacheKey = `${tone}::${text}`;
     if (_audioCache.has(cacheKey) || _pendingFetches.has(cacheKey)) continue;
-    try {
-      await fetchTTS(text, tone, audioCtx);
-    } catch (_) { /* skip failures silently */ }
-    // Throttle 200ms tra richieste per non saturare l'API
-    await new Promise(r => setTimeout(r, 200));
+    try { await fetchTTS(text, tone, audioCtx); } catch (_) {}
+    await new Promise(r => setTimeout(r, 150));
+  }
+  // Pass 2: retry falliti
+  const failed = phrases.filter(({ text, tone }) => _failedKeys.has(`${tone}::${text}`));
+  if (failed.length > 0) {
+    console.log(`[Voice] Retry ${failed.length} frasi fallite...`);
+    await new Promise(r => setTimeout(r, 2000));
+    for (const { text, tone } of failed) {
+      const ck = `${tone}::${text}`;
+      if (_audioCache.has(ck)) continue;
+      try { await fetchTTS(text, tone, audioCtx); } catch (_) {}
+      await new Promise(r => setTimeout(r, 300));
+    }
   }
 }
 
-// Raccoglie TUTTE le frasi da pre-generare
+// ---- Raccoglie tutte le frasi ----
 function getAllPhrases() {
   const phrases = [];
   const addAll = (pool, tone) => {
@@ -143,149 +197,183 @@ export function useCommentary() {
   const audioCtxRef = useRef(null);
   const currentSourceRef = useRef(null);
   const pregenStartedRef = useRef(false);
+  const speakIdRef = useRef(0);
 
+  // ---- AudioContext (creato su user gesture) ----
   const getAudioCtx = useCallback(() => {
     if (!audioCtxRef.current) {
       audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
     }
-    if (audioCtxRef.current.state === 'suspended') {
-      audioCtxRef.current.resume();
-    }
     return audioCtxRef.current;
   }, []);
+
+  const ensureAudioCtxRunning = useCallback(async () => {
+    const ctx = getAudioCtx();
+    if (ctx.state === 'suspended') {
+      await ctx.resume();
+    }
+    return ctx;
+  }, [getAudioCtx]);
 
   const notifyText = useCallback((text) => {
     currentTextRef.current = text;
     listenersRef.current.forEach(fn => fn(text));
   }, []);
 
-  // Avvia pre-generazione di TUTTE le frasi (una volta sola)
+  // ---- Pre-gen ----
   const startPregen = useCallback(() => {
     if (pregenStartedRef.current) return;
     pregenStartedRef.current = true;
     const ctx = getAudioCtx();
     const phrases = getAllPhrases();
-    console.log(`[Charon] Pre-generazione di ${phrases.length} frasi in background...`);
+    console.log(`[Voice] Pre-gen: ${phrases.length} frasi...`);
     pregenBatch(phrases, ctx).then(() => {
-      console.log(`[Charon] Pre-gen completata. ${_audioCache.size} frasi in cache.`);
+      console.log(`[Voice] Pre-gen OK. Cache: ${_audioCache.size}/${phrases.length}`);
     });
   }, [getAudioCtx]);
 
-  // Play AudioBuffer istantaneo
-  const playBuffer = useCallback((buffer) => {
+  // ---- warmUp: DEVE essere su click utente ----
+  const warmUp = useCallback(async () => {
     const ctx = getAudioCtx();
-    if (currentSourceRef.current) {
-      try { currentSourceRef.current.stop(); } catch (_) {}
+    if (ctx.state === 'suspended') {
+      await ctx.resume();
     }
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(ctx.destination);
-    source.onended = () => {
-      speakingRef.current = false;
-      currentSourceRef.current = null;
-    };
-    currentSourceRef.current = source;
-    speakingRef.current = true;
-    source.start();
-  }, [getAudioCtx]);
+    console.log(`[Voice] warmUp — AudioContext: ${ctx.state}`);
+    startPregen();
+  }, [getAudioCtx, startPregen]);
 
-  // Stop audio corrente
+  // ---- Stop tutto ----
   const stopAll = useCallback(() => {
+    // Stop Charon AudioBuffer
     if (currentSourceRef.current) {
       try { currentSourceRef.current.stop(); } catch (_) {}
       currentSourceRef.current = null;
     }
+    // Stop Web Speech
+    if ('speechSynthesis' in window) speechSynthesis.cancel();
     speakingRef.current = false;
   }, []);
 
-  // Core speak — SOLO Gemini Charon. Se non in cache → solo sottotitolo.
+  // ---- Play Charon AudioBuffer ----
+  const playBuffer = useCallback(async (buffer, id) => {
+    if (id !== speakIdRef.current) return; // stale
+    const ctx = await ensureAudioCtxRunning();
+    if (currentSourceRef.current) {
+      try { currentSourceRef.current.stop(); } catch (_) {}
+    }
+    if ('speechSynthesis' in window) speechSynthesis.cancel();
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(ctx.destination);
+    source.onended = () => { speakingRef.current = false; currentSourceRef.current = null; };
+    currentSourceRef.current = source;
+    speakingRef.current = true;
+    source.start();
+  }, [ensureAudioCtxRunning]);
+
+  // ---- Play Web Speech (fallback garantito) ----
+  const playWebSpeech = useCallback((text, tone, id) => {
+    if (id !== speakIdRef.current) return; // stale
+    if (!('speechSynthesis' in window)) return;
+    // Stop qualsiasi audio in corso
+    if (currentSourceRef.current) {
+      try { currentSourceRef.current.stop(); } catch (_) {}
+      currentSourceRef.current = null;
+    }
+    speechSynthesis.cancel();
+    const params = WS_TONES[tone] || WS_TONES.normal;
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'it-IT';
+    u.rate = params.rate;
+    u.pitch = params.pitch;
+    u.volume = params.volume;
+    const voice = getItalianVoice();
+    if (voice) u.voice = voice;
+    u.onstart = () => { speakingRef.current = true; };
+    u.onend = () => { speakingRef.current = false; };
+    u.onerror = () => { speakingRef.current = false; };
+    speechSynthesis.speak(u);
+  }, []);
+
+  // ---- Core speak ----
   const speak = useCallback((text, options = {}) => {
     if (!enabledRef.current || !text) return;
 
     const tone = options.tone || 'normal';
+    const id = ++speakIdRef.current;
 
-    // Avvia pre-gen al primo speak
     startPregen();
-
-    // Stop audio corrente — mai mix
     stopAll();
 
-    // Sottotitolo sempre visibile
+    // Sottotitolo
     notifyText(text);
     const clearMs = Math.max(4000, text.length * 70);
-    setTimeout(() => {
-      if (currentTextRef.current === text) notifyText('');
-    }, clearMs);
+    setTimeout(() => { if (currentTextRef.current === text) notifyText(''); }, clearMs);
 
     const cacheKey = `${tone}::${text}`;
 
-    // Se in cache → play istantaneo con Charon
+    // 1. Cache HIT → Charon istantaneo
     if (_audioCache.has(cacheKey)) {
-      playBuffer(_audioCache.get(cacheKey));
+      playBuffer(_audioCache.get(cacheKey), id);
       return;
     }
 
-    // Se non in cache → fetch in background per la prossima volta
-    // NESSUN fallback Web Speech — solo sottotitolo
+    // 2. Cache MISS → fetch Charon con timeout. Se fallisce → Web Speech.
     const ctx = getAudioCtx();
-    fetchTTS(text, tone, ctx).then(buffer => {
-      // Se il testo è ancora quello corrente, riproducilo appena pronto
-      if (currentTextRef.current === text && enabledRef.current) {
-        playBuffer(buffer);
-      }
-    }).catch(() => {
-      // Fetch fallito — resta solo il sottotitolo
-    });
-  }, [notifyText, playBuffer, stopAll, startPregen, getAudioCtx]);
+    fetchTTS(text, tone, ctx)
+      .then(buffer => {
+        if (id === speakIdRef.current) {
+          playBuffer(buffer, id);
+        }
+      })
+      .catch(() => {
+        // Charon fallito → Web Speech come garanzia
+        if (id === speakIdRef.current) {
+          console.log(`[Voice] Charon miss → Web Speech fallback`);
+          playWebSpeech(text, tone, id);
+        }
+      });
+  }, [notifyText, playBuffer, playWebSpeech, stopAll, startPregen, getAudioCtx]);
 
-  // Helper methods
+  // ---- Helper methods ----
   const matchIntro = useCallback(() => {
-    const text = getCommentary('MATCH_INTRO');
-    speak(text, { tone: 'normal' });
+    speak(getCommentary('MATCH_INTRO'), { tone: 'normal' });
   }, [speak]);
 
   const preShot = useCallback((shooterId) => {
-    const text = getCommentary('PRE_SHOT', shooterId);
-    speak(text, { tone: 'tense' });
+    speak(getCommentary('PRE_SHOT', shooterId), { tone: 'tense' });
   }, [speak]);
 
   const keeperReady = useCallback((keeperId) => {
-    const text = getCommentary('KEEPER_READY', keeperId);
-    speak(text, { tone: 'tense' });
+    speak(getCommentary('KEEPER_READY', keeperId), { tone: 'tense' });
   }, [speak]);
 
   const shotResult = useCallback((result) => {
-    const text = getCommentary('RESULT', result);
-    const tone = result === 'goal' ? 'excited' : 'shocked';
-    speak(text, { tone });
+    speak(getCommentary('RESULT', result), { tone: result === 'goal' ? 'excited' : 'shocked' });
   }, [speak]);
 
   const tensionMoment = useCallback(() => {
-    const text = getCommentary('TENSION');
-    speak(text, { tone: 'tense' });
+    speak(getCommentary('TENSION'), { tone: 'tense' });
   }, [speak]);
 
   const momentumComment = useCallback(() => {
-    const text = getCommentary('MOMENTUM');
-    speak(text, { tone: 'excited' });
+    speak(getCommentary('MOMENTUM'), { tone: 'excited' });
   }, [speak]);
 
   const pressureComment = useCallback(() => {
-    const text = getCommentary('PRESSURE');
-    speak(text, { tone: 'tense' });
+    speak(getCommentary('PRESSURE'), { tone: 'tense' });
   }, [speak]);
 
   const roundEnd = useCallback(() => {
-    const text = getCommentary('ROUND_END');
-    speak(text, { tone: 'normal' });
+    speak(getCommentary('ROUND_END'), { tone: 'normal' });
   }, [speak]);
 
   const matchWin = useCallback(() => {
-    const text = getCommentary('MATCH_WIN');
-    speak(text, { tone: 'epic' });
+    speak(getCommentary('MATCH_WIN'), { tone: 'epic' });
   }, [speak]);
 
   const stop = useCallback(() => {
+    speakIdRef.current++;
     stopAll();
     notifyText('');
   }, [stopAll, notifyText]);
@@ -295,32 +383,18 @@ export function useCommentary() {
     if (!v) stop();
   }, [stop]);
 
-  // Subscribe per CommentaryOverlay
   const subscribe = useCallback((fn) => {
     listenersRef.current.add(fn);
     return () => listenersRef.current.delete(fn);
   }, []);
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => { stop(); };
-  }, [stop]);
+  useEffect(() => { return () => { stop(); }; }, [stop]);
 
   return {
-    speak,
-    matchIntro,
-    preShot,
-    keeperReady,
-    shotResult,
-    tensionMoment,
-    momentumComment,
-    pressureComment,
-    roundEnd,
-    matchWin,
-    stop,
-    subscribe,
-    currentText: currentTextRef,
-    enabledRef,
-    setEnabled,
+    speak, warmUp,
+    matchIntro, preShot, keeperReady, shotResult,
+    tensionMoment, momentumComment, pressureComment,
+    roundEnd, matchWin, stop, subscribe,
+    currentText: currentTextRef, enabledRef, setEnabled,
   };
 }
